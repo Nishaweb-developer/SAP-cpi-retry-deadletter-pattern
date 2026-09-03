@@ -1,253 +1,269 @@
-# SalesOrderSync_REST_to_IDoc — SAP Cloud Integration Portfolio Project
+# SAP CPI Retry & Dead-Letter Pattern
 
-## The Big Picture — Why This Project Exists
+A hands-on SAP Cloud Integration project exploring **exception handling, automatic retries, Data Store usage, and dead-letter processing** in SAP Integration Suite.
 
-Enterprise IT constantly has to solve the same problem: getting two systems that speak
-different "languages" to talk to each other.
+This project was built by deliberately introducing failures into an iFlow and then debugging them through the Message Processing Log and stack traces.
 
-- Modern web apps, e-commerce platforms, and CRMs speak **JSON over REST** — the
-  common language of cloud-native software.
-- SAP's backend systems (ECC, S/4HANA) speak **IDoc XML** — SAP's decades-old
-  structured format for business documents like sales orders, invoices, and deliveries.
+## Project Goal
 
-Nobody rewrites SAP's core to accept JSON directly. Instead, companies put an
-**integration platform** in the middle — in this case, **SAP Cloud Integration (CI)**
-on SAP BTP — to receive the JSON, transform it into the structure SAP expects, and
-(in a real production landscape) forward it into SAP over an IDoc adapter or RFC
-connection.
+The objective is to build a reusable integration pattern where:
 
-This project is a small, self-contained proof of that pattern: a deployed, working
-iFlow that receives a JSON sales order and transforms it into IDoc-style XML — plus
-a documented, end-to-end test of that flow running live on SAP BTP.
+```text
+Main iFlow
+   |
+   | failure
+   v
+Exception Subprocess
+   |
+   v
+Retry Flow
+   |
+   +---- retry succeeds ----> processing continues
+   |
+   +---- retry limit reached ----> Dead-Letter Store
+```
 
-**Why it matters for my profile:** as an SAP ABAP / techno-functional developer, this
-demonstrates a skill set beyond custom ABAP coding — **integration engineering** on
-SAP's cloud-native middleware, which is increasingly where SAP-to-everything-else
-connectivity is being built. It also demonstrates something arguably more valuable
-than the build itself: the ability to **deploy, secure, and debug** an integration
-like a real system, not just get a tutorial demo working once.
+The **retry loop is working**. The dead-letter portion — limiting retries and routing permanently failed messages to a separate store — is still being completed.
+
+> This README intentionally documents the current working state rather than presenting the project as more complete than it is.
 
 ---
 
 ## Architecture
 
-```
-Sender (HTTPS) → Start → JSON to XML Converter → Extract Order Fields (Content Modifier) → Build_IDoc_XML (Content Modifier) → End
+The project currently contains a main flow and a separate retry flow.
+
+### Main Flow
+
+```text
+Timer / Trigger
+      |
+      v
+Main Processing
+      |
+      v
+Intentional Failure
+      |
+      v
+Exception Subprocess
+      |
+      v
+Store / Prepare Failed Message
 ```
 
-| Step | Purpose |
-|---|---|
-| **HTTPS Sender** | Receives the inbound JSON payload via POST |
-| **JSON to XML Converter** | Converts the raw JSON body into an XML structure so downstream steps can use XPath |
-| **Extract Order Fields** (Content Modifier) | Reads `orderId`, `customerId`, and `orderValue` from the XML body using XPath expressions and stores them as Exchange Properties |
-| **Build_IDoc_XML** (Content Modifier) | Constructs the final IDoc-style XML using the extracted properties |
+### Retry Flow
 
-![Content Modifier extracting order fields via XPath into Exchange Properties](images/04-content-modifier-exchange-properties.png)
-*The Content Modifier step reading `orderId`, `customerId`, and `orderValue` out of the converted XML body via XPath, and storing them as Exchange Properties for the next step to build the IDoc XML from.*
+```text
+Retry Trigger
+      |
+      v
+Read Failed Message
+      |
+      v
+Retry Processing
+      |
+      +---- Success
+      |
+      +---- Failure
+              |
+              v
+        Retry Again / Dead-Letter
+```
+
+![Overall architecture](docs/screenshots/01-architecture-plan.png)
 
 ---
 
-## Design Decisions & Trade-offs
+## What I Practiced
 
-- **JSON to XML Converter over Groovy scripting:** initially built with a Groovy
-  script step to parse the JSON body manually, but pivoted to SAP's built-in
-  JSON to XML Converter step combined with XPath-based Content Modifiers. This
-  keeps the flow entirely low-code/no-script — more maintainable and easier for
-  other developers to read.
-- **XPath over inline JSON expressions:** SAP CI's Content Modifier uses Camel
-  Simple expression syntax, which does not support a `${json.x}` style accessor
-  directly on a JSON body. Converting to XML first and using XPath is the
-  standard, documented pattern for this kind of extraction.
-- **Content Modifier for transformation, not scripting:** given the fields
-  involved were simple 1:1 mappings, a script step would have been unnecessary
-  complexity. Content Modifiers keep the transformation logic visible directly
-  in the flow designer.
-
-## Known Trial-Tenant Limitations
-
-Built and tested on a free SAP BTP trial tenant, which has some constraints:
-
-- Only a limited number of iFlows can be deployed concurrently.
-- No live backend S/4HANA system is connected on the trial tier, so the actual
-  IDoc is not posted into a real SAP system — the flow demonstrates the
-  *transformation and orchestration logic*, stopping at generating the IDoc XML.
-- In a production scenario, the final step would route to an **IDoc adapter**
-  or **RFC destination** instead of ending at a simple End event.
+* Exception Subprocess in SAP Cloud Integration
+* Handling failures intentionally for testing
+* Retry flow design
+* Data Store operations
+* Passing information between integration steps
+* Message body vs. headers vs. exchange properties
+* Debugging with the Message Processing Log
+* Reading stack traces instead of relying only on the iFlow canvas
+* XML wrapping for Data Store processing
+* Building toward a dead-letter pattern
 
 ---
 
-## Setting Up API Access — Step by Step
+## Key Learning: Debugging Matters
 
-To call a deployed iFlow's HTTPS endpoint securely (rather than just viewing it
-in the designer), you need OAuth2 client credentials from BTP. Here's the exact
-path I followed.
+The most useful part of this exercise was not simply getting the retry flow to run.
 
-### Step 1 — Confirm the trial subaccount and existing instances
+I deliberately broke the integration several times and traced each failure back to its root cause.
 
-Under **BTP Cockpit → Instances and Subscriptions**, I could see the ABAP
-environment and Destination service instances already in place, but nothing yet
-for calling Cloud Integration's runtime API directly.
+Some issues were not obvious from the iFlow canvas. The useful clues came from the **raw Message Processing Log and exception stack trace**.
 
-![BTP Cockpit Instances and Subscriptions overview](images/01-btp-instances-subscriptions.png)
-*Starting point — existing instances in the subaccount, before creating dedicated API access for Cloud Integration.*
+That changed the way I approach CPI debugging:
 
-### Step 2 — Create a Process Integration Runtime instance
-
-From **Service Marketplace → SAP Process Integration Runtime**, I created a new
-instance using the **`integration-flow`** plan — this is the plan that exposes
-API access for calling and managing deployed iFlows (as opposed to other plans
-that expose different Cloud Integration APIs), scoped to the **Cloud Foundry /
-dev** space.
-
-![Creating the SAP Process Integration Runtime instance with the integration-flow plan](images/02-create-pi-runtime-instance.png)
-*Instance creation form — Service: SAP Process Integration Runtime, Plan: integration-flow, Runtime Environment: Cloud Foundry, Space: dev.*
-
-### Step 3 — Instance created
-
-The instance (`cpi-api-access`) was created successfully under Cloud Foundry,
-with the technical service name `it-rt`.
-
-![The cpi-api-access instance shown as Created, with Bound Applications and Service Keys tabs](images/03-pi-runtime-instance-created.png)
-*Confirmed instance with Status: Created — next step is generating a service key from here to get OAuth2 credentials.*
-
-### Step 4 — Generate a service key
-
-From the instance's **Service Keys** tab, I created a new key (`cpi-api-key`).
-This returns a JSON object containing:
-
-```json
-{
-  "oauth": {
-    "clientid": "sb-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx!bxxxxxx|it-rt-xxxxxxxxtrial!bxxxxx",
-    "clientsecret": "<redacted>",
-    "tokenurl": "https://<subdomain>.authentication.us10.hana.ondemand.com/oauth/token",
-    "url": "https://<subdomain>.it-cpitrial05-rt.cfapps.us10-001.hana.ondemand.com"
-  }
-}
+```text
+Error
+  ↓
+Read the exception
+  ↓
+Identify the failing component
+  ↓
+Understand what CPI is actually doing
+  ↓
+Change one thing
+  ↓
+Redeploy / retest
 ```
-
-> **Security note:** the `clientid`/`clientsecret` pair here are live credentials
-> for the trial tenant. They are never committed to this repo or shown in
-> screenshots — only the field *shape* is documented above. Keys used during
-> testing were rotated (deleted and regenerated) after this write-up was completed.
-
-### Step 5 — Find the real deployed endpoint
-
-Rather than assuming the endpoint path from the design-time adapter config, I
-confirmed the actual resolved URL from **Monitor → Manage Integration Content**,
-under the iFlow's **Endpoints** tab.
-
-![Manage Integration Content showing the deployed iFlow's resolved endpoint URL](images/05-deployed-iflow-endpoint.png)
-*`SalesOrderSync_REST_to_IDoc` — Status: Started. Resolved endpoint: `https://<subdomain>.it-cpitrial05-rt.cfapps.us10-001.hana.ondemand.com/http/salesordersync2026`*
-
-This caught a real mismatch: the endpoint path configured on the adapter
-(`/salesordersync2026`) resolved differently than the placeholder path used
-in early testing (`/http/salesorder`) — see the Troubleshooting Journey below.
 
 ---
 
-## Testing the Deployed Flow
+## Troubleshooting Findings
 
-### 1. Get an OAuth2 access token
+### 1. Exchange Properties and Exception Handling
 
-```bash
-curl -X POST "https://<subdomain>.authentication.us10.hana.ondemand.com/oauth/token" \
-  -d "grant_type=client_credentials" \
-  -d 'client_id=<clientid>' \
-  -d 'client_secret=<clientsecret>'
-```
+One of the issues I encountered was that values stored as Exchange Properties before an exception did not behave as expected inside the Exception Subprocess.
 
-Returns a bearer token:
+Headers behaved differently.
 
-```json
-{ "access_token": "eyJhbGciOi...", "token_type": "bearer", "expires_in": 43199 }
-```
-
-### 2. Call the deployed iFlow
-
-```bash
-curl -X POST "https://<subdomain>.it-cpitrial05-rt.cfapps.us10-001.hana.ondemand.com/http/salesordersync2026" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <access_token>" \
-  -d '{
-    "orderId": "SO1001",
-    "customerId": "CUST500",
-    "orderValue": "2500"
-  }'
-```
-
-### 3. Result — successful transformation
-
-```xml
-<IDOC>
-  <E1EDK01>
-    <BELNR>SO1001</BELNR>
-    <KUNNR>CUST500</KUNNR>
-    <NETWR>2500</NETWR>
-  </E1EDK01>
-</IDOC>
-```
-
-Confirmed end to end: OAuth token → HTTPS POST with JSON → JSON-to-XML
-conversion → XPath extraction → IDoc XML construction → response returned.
+This became an important reminder not to assume that every message attribute has the same lifecycle during exception handling.
 
 ---
 
-## Troubleshooting Journey (worth knowing for interviews)
+### 2. Data Store Select and XML
 
-Getting this flow to a fully working, externally-callable state involved two
-rounds of systematic debugging.
+The Data Store Select operation produced an XML parsing error when the stored content was JSON.
 
-**Round 1 — Getting the flow to deploy (`Started` status):**
+The important clue was the **Woodstox XML parser exception**.
 
-1. Started with a generic `CAMEL_CONTEXT_NOT_STARTED` deployment error with no
-   detailed stack trace available.
-2. Used **bisection**: temporarily stripped the flow down to just
-   `Start → End`, redeployed, and confirmed the sender adapter and tenant were
-   healthy.
-3. Reintroduced steps one at a time, isolating the failure to the Content
-   Modifier's expression syntax.
-4. Identified that `${json.x}` is not valid Camel Simple syntax in SAP CI, and
-   replaced it with a JSON-to-XML conversion + XPath approach.
-5. Used the **Problems tab** to catch remaining validation issues (missing XML
-   namespace, unset Data Type fields, an orphaned Receiver participant) before
-   final deployment.
+Instead of treating the error as a generic CPI failure, I traced the exception back to the operation and discovered that the selected content was being processed as XML.
 
-**Round 2 — Getting an external OAuth-authenticated call to succeed:**
+The solution was to work with an XML-wrapped representation for this part of the flow.
 
-1. First call returned **404 Not Found** — the endpoint path assumed from the
-   README (`/http/salesorder`) didn't match the actual deployed path. Fixed by
-   checking the real resolved URL under **Monitor → Manage Integration Content
-   → Endpoints**, which showed `/http/salesordersync2026`.
-2. Second call, now against the correct URL, returned **403 Forbidden** —
-   despite a valid OAuth token and a correctly configured `ESBMessaging.send`
-   User Role on the adapter.
-3. Traced the cause to the **CSRF Protected** checkbox being enabled on the
-   HTTPS sender adapter's Connection tab. CSRF protection expects a browser-style
-   session flow (fetch a CSRF token via GET, then include it on the POST) —
-   it isn't meant for direct OAuth2 machine-to-machine calls like this one.
-4. Disabled CSRF Protected on the adapter (appropriate here since this is a
-   REST-triggered, non-browser client scenario), redeployed, and the call
-   succeeded.
+![XML wrapped fix](docs/screenshots/06-xml-wrapped-fix.png)
 
-![HTTPS adapter Connection tab showing the User Role and CSRF Protected setting](images/06-https-adapter-csrf-setting.png)
-*The setting that caused the 403 — CSRF Protected was checked by default, which blocks direct machine-to-machine POST calls without a prior CSRF-token handshake.*
+---
 
-This kind of methodical isolation — narrowing a vague error down to its exact
-root cause, whether at deploy time or at call time — is the same approach I'd
-bring to debugging any integration issue in a production landscape.
+### 3. One Bad Data Store Entry Can Affect the Read
+
+Another useful finding was that a malformed entry could cause the Data Store read/batch operation to fail rather than simply skipping the problematic entry.
+
+That made validation and careful Data Store handling an important part of the design.
+
+---
+
+## Main Flow
+
+The main flow is configured to trigger processing and intentionally create a failure so that the exception-handling path can be tested.
+
+![Main flow timer setup](docs/screenshots/02-mainflow-timer-setup.png)
+
+The successful deployment and processing behaviour is documented through the project screenshots and debugging log.
+
+---
+
+## Retry Flow
+
+The retry flow is the core of this exercise.
+
+Its responsibility is to pick up the failed message and attempt processing again.
+
+![Retry flow structure](docs/screenshots/07-retryflow-full-structure.png)
+
+The retry flow has been tested successfully. The next step is to introduce a retry counter/limit and move messages that continue to fail into a dedicated dead-letter store.
+
+---
+
+## Current Status
+
+| Area                              | Status               |
+| --------------------------------- | -------------------- |
+| Main iFlow                        | ✅ Working            |
+| Intentional failure               | ✅ Tested             |
+| Exception Subprocess              | ✅ Tested             |
+| Retry flow                        | ✅ Working            |
+| Data Store usage                  | ✅ Tested             |
+| XML-wrapped Data Store content    | ✅ Tested             |
+| Retry limit                       | 🚧 In progress       |
+| Dead-letter routing               | 🚧 In progress       |
+| Production SAP backend connection | ⏳ Future enhancement |
+
+---
+
+## Screenshots
+
+The repository keeps the working screenshots under:
+
+```text
+docs/
+└── screenshots/
+    ├── 01-architecture-plan.png
+    ├── 02-mainflow-timer-setup.png
+    ├── 03-mainflow-deployed-success...
+    ├── 04-errorstore-entries-waiting...
+    ├── 05-content-modifier-payload...
+    ├── 06-xml-wrapped-fix.png
+    ├── 07-retryflow-full-structure.png
+    ├── 08-retryflow-completed-log...
+    └── 09-mainflow-completed-log...
+```
+
+Additional debugging notes are maintained in [`docs/debugging-log.md`](docs/debugging-log.md).
+
+---
+
+## Why This Project Matters
+
+For an SAP ABAP / techno-functional developer, this project is an opportunity to move beyond writing backend code and practice **integration engineering on SAP BTP**.
+
+The focus is not just on building an iFlow, but on understanding what happens when the integration fails:
+
+* Where did the failure occur?
+* What information survived the exception?
+* What does the stack trace actually tell me?
+* How should failed messages be retried?
+* When should a message stop being retried?
+* Where should permanently failed messages go?
+
+These are the questions I am using to make the project closer to a real integration scenario.
 
 ---
 
 ## Tech Stack
 
-- SAP Integration Suite (Cloud Integration), trial tenant
-- SAP BTP — Process Integration Runtime service (OAuth2 client credentials)
-- Camel Simple expressions, XPath
-- HTTPS adapter, JSON to XML Converter, Content Modifier steps
-- curl (bash) for endpoint testing
+* SAP Integration Suite — Cloud Integration
+* SAP BTP
+* SAP Cloud Integration Exception Subprocess
+* Data Store
+* Content Modifier
+* Timer / Trigger
+* XML
+* Message Processing Log
+* Stack-trace based debugging
+
+---
+
+## Next Step
+
+The next milestone is to complete the **dead-letter handling**:
+
+```text
+Failure
+   ↓
+Retry 1
+   ↓
+Retry 2
+   ↓
+Retry N
+   ↓
+Retry limit reached
+   ↓
+Dead-Letter Store
+```
+
+After that, I plan to extend the portfolio scenario toward a **cloud-to-on-premise SAP integration**, using the integration pattern in a more realistic SAP landscape.
+
+---
 
 ## Author
 
-Sharfunisa Shajahan — SAP ABAP / techno-functional developer, based in KAEC, Saudi Arabia.
-# SAP-cpi-retry-deadletter-pattern
+**Sharfunisa Shajahan**
+
+SAP ABAP / Techno-Functional Developer
